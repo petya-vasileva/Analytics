@@ -3,8 +3,8 @@ import socket
 import ipaddress
 
 
-### Try to resolve IP addresses that were filled for host names.
-### If it's a host name - take it. 
+### Try to resolve IP addresses that were filled for host names and exclude data not relevant to the project
+### If it's a host name, verify it's part of the configuration
 ###   If it's an IP - try to resolve 
 ###     If it cannot be resolved - serach in ps_meta for the host name
 def ResolveHost(es, host):
@@ -13,10 +13,32 @@ def ResolveHost(es, host):
     u = []
 
     try:
+        # There are data that is collected in ElasticSearch, but it's not relevant to the SAND project.
+        # It is neccessary to check if it is part of the configuration by searching in ps_meta index.
         if is_host:
-            h = host
+            is_valid = {
+                          "size": 1,
+                          "_source": ["host"],
+                          "query": {
+                            "bool":{
+                              "must":[
+                                {
+                                  "match_phrase": {
+                                    "host":host
+                                        }
+                                }
+                              ]
+                            }
+                          }
+                        }
+            res = es.search("ps_meta", body=is_valid)
+            if res['hits']['hits']:
+                h = host
+            else:
+                u.append(host)
+                u.append("Host not part of configuration")
         else:
-            # Sometimes host name is not resolved and instead IP address is added. Try to resolve the given IP or host name
+            # Sometimes host name is not resolved and instead IP address is added. Try to resolve the given IP
             h = socket.gethostbyaddr(host)[0]
     except Exception as inst:
         version = ipaddress.ip_address(host).version 
@@ -26,17 +48,17 @@ def ResolveHost(es, host):
             v = {'external_address.ipv6_address':host}
 
         # It is possible that the IP got changed but the host is still valid. Check if the ip exists in ps_meta and take the host name. 
-        check_host = {
+        check_hostname = {
                   "_source": ["host"],
                   "size": 1, 
                     "query": {
                       "match" : v
                     }
                 }
-        res = es.search("ps_meta", body=check_host)
+        res = es.search("ps_meta", body=check_hostname)
         if res['hits']['hits']:
             h = res['hits']['hits'][0]['_source']['host']
-            print('IP',host, 'was found in ps_meta:', h)
+#             print('IP',host, 'was found in ps_meta:', h)
         # if it's a unknown hostname the ip check will fail
         u.append(host)
         u.append(inst.args)
