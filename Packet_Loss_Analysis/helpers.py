@@ -1,13 +1,14 @@
 import re
 import socket
 import ipaddress
-import json
+import csv
 import multiprocessing as mp
 from functools import partial
 from contextlib import contextmanager
 from tqdm import tqdm
 import time
 import os
+import datetime
 
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan
@@ -27,65 +28,169 @@ def ConnectES():
     else: print("Connection Unsuccessful")
 
 
+def GetHostsMetaData():
+    # The query is aggregating results by month, host, ipv4 and ipv6. The order is ascending.
+    # That way we ensure the last added host name in the ip_data dictionary is the most recent one. We add it at position 0.
+    query = {
+      "size" : 0,
+      "_source" : False,
+      "stored_fields" : "_none_",
+      "aggregations" : {
+        "perf_meta" : {
+          "composite" : {
+            "size" : 9999,
+            "sources": [
+              {
+                "ts" : {
+                  "terms" : {
+                    "script" : {
+                      "source" : "InternalSqlScriptUtils.dateTrunc(params.v0,InternalSqlScriptUtils.docValue(doc,params.v1),params.v2)",
+                      "lang" : "painless",
+                      "params" : {
+                        "v0" : "month",
+                        "v1" : "timestamp",
+                        "v2" : "Z"
+                      }
+                    },
+                    "missing_bucket" : True,
+                    "value_type" : "long",
+                    "order" : "asc"
+                  }
+                }
+              },
+              {
+                "host" : {
+                  "terms" : {
+                    "field" : "host.keyword",
+                    "missing_bucket" : True
+                    }
+                }
+              },
+              {
+                "ipv4" : {
+                  "terms" : {
+                    "field" : "external_address.ipv4_address",
+                    "missing_bucket" : True
+                    }
+                }
+              },
+              {
+                "ipv6" : {
+                  "terms" : {
+                    "field" : "external_address.ipv6_address",
+                    "missing_bucket" : True
+                    }
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+
+
+    a = datetime.datetime.now()
+    data = es.search("ps_meta", body=query)
+
+    ip_data = {}
+    def Add2Dict(ip, host):
+        temp = []
+        if (ip in ip_data):
+            if (host not in ip_data[ip]) and (host != ''):
+                temp.append(host)
+                temp.extend(ip_data[ip])
+                ip_data[ip] = temp
+        else:
+            ip_data[ip] = [host]
+
+
+    host_list = []
+    a = datetime.datetime.now()
+    for item in data["aggregations"]["perf_meta"]["buckets"]:
+
+        ipv4 = item['key']['ipv4']
+        ipv6 = item['key']['ipv6']
+        host = item['key']['host']
+
+        if ipv4 is not None:
+            Add2Dict(ipv4, host)
+
+        if ipv6 is not None:
+            Add2Dict(ipv6, host)
+
+        if host not in host_list:
+            host_list.append(host)
+
+    print("Time elapsed = %s" % (datetime.datetime.now() - a))
+    return {'hosts': host_list, 'ips': ip_data}
+
+
 manager = mp.Manager()
 unresolved = manager.dict()
 hosts = manager.dict()
-empty = manager.list()
 
-#### Fix hosts so that
+es = ConnectES()
+meta = GetHostsMetaData()
+hosts_meta = meta['hosts']
+ips_meta = meta['ips']
+
+
+#### Fix hosts by:
+####   replacing IP addresses with correct host names:
+####   removing documents that are not part of the configuration
 def FixHosts(item, unres):
-    src_item = item['src_host']
-    dest_item = item['dest_host']
+    # If host is empty try with the IP
+    src_item = item['src_host'] if item['src_host'] != '' else item['src']
+    dest_item = item['dest_host'] if item['dest_host'] != '' else item['dest']
     isOK = False
-    if (src_item != '' and dest_item != ''):
-        if src_item in hosts:
-            if hosts[src_item] != 'unresolved':
-                isOK = True
-                item['src_host'] = hosts[src_item]
-            else: isOK = False
-        else:
-#         if not src_item in hosts:
-            src = ResolveHost(item['src_host'])
-            if ((len(src['resolved']) != 0)):
-                isOK = True
-                item['src_host'] = src['resolved']
-                hosts[src_item] = src['resolved']
-            elif ((src['unknown'])):
-                isOK = False
-                unres[src['unknown'][0]] = src['unknown'][1]
-                hosts[src_item] = 'unresolved'
-        if not dest_item in hosts:
-            dest = ResolveHost(item['dest_host'])
-            if ((len(dest['resolved']) != 0)):
-                isOK = True
-                item['dest_host'] = dest['resolved']
-                hosts[dest_item] = dest['resolved']
-            elif ((dest['unknown'])):
-                isOK = False
-                unres[dest['unknown'][0]] = dest['unknown'][1]
-                hosts[dest_item] = 'unresolved'
-#         else: 
-#             if hosts[src_item] != 'unresolved':
-#                 isOK = True
-#                 item['src_host'] = hosts[src_item]
-#             else: isOK = False
+
+    # If host was checked and resolved already just take it from the shared dictionary
+    if src_item in hosts:
+        if hosts[src_item] != 'unresolved':
+            isOK = True
+            item['src_host'] = hosts[src_item]
+        else: isOK = False
+    # If host is not in hosts already, try to resolve it then add the result to the shared dictionary
     else:
-        isOK = False
-        empty.append('src_host: '+src_item+' dest_host: '+dest_item+' at '+item['timestamp'])
+        src = ResolveHost(src_item)
+        if (src['resolved']):
+            isOK = True
+            item['src_host'] = src['resolved']
+            hosts[src_item] = src['resolved']
+        elif (src['unknown']):
+            isOK = False
+            unres[src['unknown'][0]] = src['unknown'][1]
+            hosts[src_item] = 'unresolved'
+
+    if dest_item in hosts:
+        if hosts[dest_item] != 'unresolved':
+            isOK = True
+            item['dest_host'] = hosts[dest_item]
+        else: isOK = False
+    else:
+        dest = ResolveHost(dest_item)
+        if (dest['resolved']):
+            isOK = True
+            item['dest_host'] = dest['resolved']
+            hosts[dest_item] = dest['resolved']
+        elif ((dest['unknown'])):
+            isOK = False
+            unres[dest['unknown'][0]] = dest['unknown'][1]
+            hosts[dest_item] = 'unresolved'
+
     if (isOK == True):
         return item
 
     
 ### Process the dataset in parallel
 def ProcessHosts(data): 
-    
     @contextmanager
     def poolcontext(*args, **kwargs):
         pool = mp.Pool(*args, **kwargs)
         yield pool
         pool.terminate()
 
-    with poolcontext(processes=mp.cpu_count()) as pool:  
+    with poolcontext(processes=mp.cpu_count()) as pool:
         start = time.time()
         print('Start:', time.strftime("%H:%M:%S", time.localtime()))
         i = 0
@@ -98,29 +203,21 @@ def ProcessHosts(data):
             i = i + 1
         print("Time elapsed = %s" % (int(time.time() - start)))
         print('Number of unique hosts:', len(hosts))
-        
-    file1 = open('output.txt', 'w')
-    file1.write('******************************** UNRESOLVED HOSTS ********************************')
-#     for k,v in dict(unresolved).items():
-#         file1.write('\n')
-    file1.write(json.dumps(dict(unresolved)))
-    
-    if len(empty)>0:
-        file1.write('\n')
-        file1.write('******************************** EMPTY VALUES ********************************')
-        for h in empty:
-            file1.write(h)     
-    file1.close()
-    
-    return results
 
+    f = open("not_found.csv", "w")
+    w = csv.writer(f)
+    w.writerow(['host', 'message'])
+    for key, val in dict(unresolved).items():
+        w.writerow([key, val])
+    f.close()
+
+    return results
 
 ### Try to resolve IP addresses that were filled for host names and thus exclude data not relevant to the project
 ### If it's a host name, verify it's part of the configuration, i.e. search in ps_meta
 ###   If it's an IP - try to resolve 
 ###     If it cannot be resolved - serach in ps_meta for the host name
 def ResolveHost(host):
-    es = ConnectES()
     is_host = re.match("^(([a-zA-Z]|[a-zA-Z][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z]|[A-Za-z][A-Za-z0-9\-]*[A-Za-z0-9])$", host)
     h = ''
     u = []
@@ -129,24 +226,7 @@ def ResolveHost(host):
         # There are data that is collected in ElasticSearch, but it's not relevant to the SAND project.
         # It is neccessary to check if it is part of the configuration by searching in ps_meta index.
         if is_host:
-            is_valid = {
-                          "size": 1,
-                          "_source": ["host"],
-                          "query": {
-                            "bool":{
-                              "must":[
-                                {
-                                  "match_phrase": {
-                                    "host":host
-                                        }
-                                }
-                              ]
-                            }
-                          }
-                        }
-#             print(is_valid)
-            res = es.search("ps_meta", body=is_valid)
-            if res['hits']['hits']:
+            if host in hosts_meta:
                 h = host
             else:
                 u.append(host)
@@ -155,26 +235,11 @@ def ResolveHost(host):
             # Sometimes host name is not resolved and instead IP address is added. Try to resolve the given IP
             h = socket.gethostbyaddr(host)[0]
     except Exception as inst:
-        version = ipaddress.ip_address(host).version 
-        if (version == 4):
-            v = {'external_address.ipv4_address':host}
-        elif (version == 6):
-            v = {'external_address.ipv6_address':host}
-
         # It is possible that the IP got changed but the host is still valid. Check if the ip exists in ps_meta and take the host name. 
-        check_hostname = {
-                  "_source": ["host"],
-                  "size": 1, 
-                    "query": {
-                      "match" : v
-                    }
-                }
-        res = es.search("ps_meta", body=check_hostname)
-        if res['hits']['hits']:
-            h = res['hits']['hits'][0]['_source']['host']
-#             print('IP',host, 'was found in ps_meta:', h)
-        # if it's a unknown hostname the ip check will fail
-        u.append(host)
-        u.append(inst.args)
-    
+        if host in ips_meta:
+            h = ips_meta[host][0]
+        else:
+            u.append(host)
+            u.append(inst.args)
+
     return {'resolved': h, 'unknown': u}
