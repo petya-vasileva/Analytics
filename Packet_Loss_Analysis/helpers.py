@@ -9,6 +9,7 @@ from tqdm import tqdm
 import time
 import os
 import datetime
+import pandas as pd
 
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan
@@ -88,8 +89,6 @@ def GetHostsMetaData():
       }
     }
 
-
-    a = datetime.datetime.now()
     data = es.search("ps_meta", body=query)
 
     ip_data = {}
@@ -105,7 +104,6 @@ def GetHostsMetaData():
 
 
     host_list = []
-    a = datetime.datetime.now()
     for item in data["aggregations"]["perf_meta"]["buckets"]:
 
         ipv4 = item['key']['ipv4']
@@ -121,7 +119,6 @@ def GetHostsMetaData():
         if host not in host_list:
             host_list.append(host)
 
-    print("Time elapsed = %s" % (datetime.datetime.now() - a))
     return {'hosts': host_list, 'ips': ip_data}
 
 
@@ -190,26 +187,31 @@ def ProcessHosts(data):
         yield pool
         pool.terminate()
 
+    start = time.time()
+    print('Start:', time.strftime("%H:%M:%S", time.localtime()))
     with poolcontext(processes=mp.cpu_count()) as pool:
-        start = time.time()
-        print('Start:', time.strftime("%H:%M:%S", time.localtime()))
         i = 0
         results = []
         for doc in pool.imap_unordered(partial(FixHosts, unres=unresolved), data):
-            if i % 100000 == 0:
-                print("next 100K",i)
+            if (i > 0) and (i % 100000 == 0):
+                print('Next',i,'items')
             if doc is not None:
                 results.append(doc)
             i = i + 1
-        print("Time elapsed = %s" % (int(time.time() - start)))
-        print('Number of unique hosts:', len(hosts))
+    print("Time elapsed = %ss" % (int(time.time() - start)))
+    print('Number of unique hosts:', len(hosts))
 
-    f = open("not_found.csv", "w")
-    w = csv.writer(f)
-    w.writerow(['host', 'message'])
+    try:
+        not_found = pd.read_csv('not_found.csv')
+    except (pd.io.common.EmptyDataError, FileNotFoundError) as error:
+        not_found = pd.DataFrame(columns=['host', 'message'])
+
     for key, val in dict(unresolved).items():
-        w.writerow([key, val])
-    f.close()
+        if not (not_found['host'].str.contains(key).any()):
+            not_found.loc[len(not_found)+1] = [key, val]
+
+    not_found.sort_values(['host', 'message'], ascending=[True, False], inplace=True)
+    not_found.to_csv('not_found.csv', index=False)
 
     return results
 
