@@ -7,6 +7,7 @@ import time
 import socket
 import re
 from ipwhois import IPWhois
+import difflib
 
 import queries as qrs
 import helpers as hp
@@ -77,6 +78,43 @@ class HostsMetaData:
         return ''
 
 
+    def findSite(self, row, df, hosts):
+        # we tend to fill in only sites for hosts part of the configuration
+        if ((row['site_x'] is None) and (row['host_in_ps_meta'] == True)):
+            ratio = {}
+            hs = row['host']
+            meta_sites = df[(df['host'] == hs)]['site_y'].values
+            first_non_null = next(filter(bool, (x for x in meta_sites)), None)
+            # if site name is available in ps_meta data, take it
+            # first_non_null == first_non_null - that expression checks if the value is NaN
+            if ((first_non_null) and (first_non_null == first_non_null)):
+                return first_non_null
+            else:
+                # otherwise find a similar host name and take its site name
+                for h in hosts:
+                    if h != hs:
+                        similarity = difflib.SequenceMatcher(None, hs, h).ratio()
+                        ratio[h] = similarity
+                # get the value with the highest similarity score
+                sib =  max(ratio, key=ratio.get)
+
+                sib_site_index = df[df['host'] == sib]['site_x'].values
+                fnn_index = next(filter(bool, (x for x in sib_site_index)), None)
+                sib_site_meta = df[df['host'] == sib]['site_y'].values
+                fnn_meta = next(filter(bool, (x for x in sib_site_meta)), None)
+
+                # Check for the site name of the sibling
+                if (fnn_index):
+                    return fnn_index
+                elif (fnn_meta):
+                    return fnn_meta
+                # otherwise get get IPWhoIs network name
+                else:
+                    return self.getIPWhoIs(sib)
+        else: 
+            return row['site_x']
+
+
     def getIPWhoIs(self, item):
         val = ''
         try:
@@ -135,13 +173,11 @@ class HostsMetaData:
 
         df['host'] = df.apply(lambda row: self.findHost(row, df), axis=1)
 
-        # get site name if it exists in ps_*, else get site name from ps_meta if it's not null, 
+        # get site name if it exists in ps_*, else get site name from ps_meta if it's not null,
         # otherwise use IPWhoIS network name, but only fro the hosts part of the configuration (present in ps_meta)
-        df['site'] = np.where(df['site_x'].isnull(), np.where(df['site_y'].isnull(), '', df['site_y']), df['site_x'])
+        hosts = df[df['host_in_ps_meta'] == True]['host'].values
+        df['site'] = df.apply(lambda row: self.findSite(row, df, hosts), axis=1)
         df.rename(columns={'site_x': 'site_index', 'site_y': 'site_meta'}, inplace=True)
-        df['site'] = df.apply(lambda row: self.getIPWhoIs(row['ip']) 
-                                          if (row['site'] == '' and row['host_in_ps_meta'] == True) 
-                                          else row['site'], axis=1)
 
         print("BuildDataFrame took %ss" % (int(time.time() - start)))
         return df
